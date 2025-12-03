@@ -387,9 +387,12 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
               <thead className="bg-zinc-950">
                 <tr className="text-left text-sm text-gray-400">
                   <th className="p-4">Wallet</th>
-                  <th className="p-4 text-right">Inflow</th>
-                  <th className="p-4 text-right">Outflow</th>
-                  <th className="p-4 text-right">Net Flow</th>
+                  <th className="p-4 text-right">Inflow (SOL)</th>
+                  <th className="p-4 text-right">Inflow (USD)</th>
+                  <th className="p-4 text-right">Outflow (SOL)</th>
+                  <th className="p-4 text-right">Outflow (USD)</th>
+                  <th className="p-4 text-right">Net (SOL)</th>
+                  <th className="p-4 text-right">Net (USD)</th>
                   <th className="p-4 text-right">Txs</th>
                   <th className="p-4">First Tx</th>
                   <th className="p-4">Last Tx</th>
@@ -410,8 +413,14 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
                     <td className="p-4 text-right text-green-400">
                       {formatSol(wallet.totalInflowSol)}
                     </td>
+                    <td className="p-4 text-right text-green-400/70 text-sm">
+                      {results.solPrice > 0 ? formatUsd(wallet.totalInflowSol * results.solPrice) : '-'}
+                    </td>
                     <td className="p-4 text-right text-red-400">
                       {formatSol(wallet.totalOutflowSol)}
+                    </td>
+                    <td className="p-4 text-right text-red-400/70 text-sm">
+                      {results.solPrice > 0 ? formatUsd(wallet.totalOutflowSol * results.solPrice) : '-'}
                     </td>
                     <td
                       className={`p-4 text-right font-medium ${
@@ -420,6 +429,18 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
                     >
                       {wallet.netFlowSol >= 0 ? '+' : ''}
                       {formatSol(wallet.netFlowSol)}
+                    </td>
+                    <td
+                      className={`p-4 text-right text-sm ${
+                        wallet.netFlowSol >= 0 ? 'text-green-400/70' : 'text-red-400/70'
+                      }`}
+                    >
+                      {results.solPrice > 0 ? (
+                        <>
+                          {wallet.netFlowSol >= 0 ? '+' : ''}
+                          {formatUsd(wallet.netFlowSol * results.solPrice)}
+                        </>
+                      ) : '-'}
                     </td>
                     <td className="p-4 text-right text-gray-400">{wallet.transactionCount}</td>
                     <td className="p-4 text-sm text-gray-400">{formatDate(wallet.firstTxTime)}</td>
