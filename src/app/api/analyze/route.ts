@@ -5,10 +5,9 @@ const MAX_RETRIES = 3
 const BASE_DELAY_MS = 1000
 const REQUEST_DELAY_MS = 250 // Delay between consecutive requests
 
-// Multiple free RPC endpoints to rotate through when rate limited
+// Public RPC endpoint (user can provide their own for better rate limits)
 const PUBLIC_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
-  'https://mainnet.helius-rpc.com/?api-key=1d8740dc-e5f4-421c-b823-e1bad1889eff',
 ]
 
 let currentRpcIndex = 0
@@ -88,8 +87,8 @@ async function rpcCall(
     }
 
     if (!response.ok) {
-      // Try another endpoint on server errors or forbidden
-      if (response.status >= 500 || response.status === 403) {
+      // Try another endpoint on server errors, forbidden, or unauthorized
+      if (response.status >= 500 || response.status === 403 || response.status === 401) {
         const nextEndpoint = getNextRpcEndpoint(rpcUrl)
         if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
           console.log(`Error ${response.status} on ${rpcUrl}, switching to ${nextEndpoint}`)
