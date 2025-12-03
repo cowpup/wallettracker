@@ -114,6 +114,35 @@ export default function Home() {
     URL.revokeObjectURL(url)
   }
 
+  const exportCsv = () => {
+    if (!results) return
+
+    const headers = ['Wallet', 'Inflow (SOL)', 'Outflow (SOL)', 'Net Flow (SOL)', 'Transactions', 'First Tx', 'Last Tx', 'Error']
+    const rows = results.results.map((wallet) => [
+      wallet.address,
+      wallet.totalInflowSol.toFixed(4),
+      wallet.totalOutflowSol.toFixed(4),
+      wallet.netFlowSol.toFixed(4),
+      wallet.transactionCount.toString(),
+      wallet.firstTxTime ? new Date(wallet.firstTxTime * 1000).toISOString() : '',
+      wallet.lastTxTime ? new Date(wallet.lastTxTime * 1000).toISOString() : '',
+      wallet.error || '',
+    ])
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(',')),
+    ].join('\n')
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'wallet-analysis.csv'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <main className="min-h-screen p-4 md:p-8 max-w-6xl mx-auto">
       <div className="mb-8">
@@ -279,12 +308,20 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
                 </div>
               )}
 
-              <button
-                onClick={exportJson}
-                className="w-full mt-2 bg-zinc-800 hover:bg-zinc-700 text-white py-2 px-4 rounded-lg transition-colors text-sm"
-              >
-                Export JSON
-              </button>
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={exportCsv}
+                  className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-white py-2 px-4 rounded-lg transition-colors text-sm"
+                >
+                  Export CSV
+                </button>
+                <button
+                  onClick={exportJson}
+                  className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-white py-2 px-4 rounded-lg transition-colors text-sm"
+                >
+                  Export JSON
+                </button>
+              </div>
             </div>
           )}
         </div>
