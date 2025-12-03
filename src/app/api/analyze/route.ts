@@ -8,9 +8,7 @@ const REQUEST_DELAY_MS = 250 // Delay between consecutive requests
 // Multiple free RPC endpoints to rotate through when rate limited
 const PUBLIC_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
-  'https://solana-mainnet.g.alchemy.com/v2/demo',
-  'https://rpc.ankr.com/solana',
-  'https://solana.public-rpc.com',
+  'https://mainnet.helius-rpc.com/?api-key=1d8740dc-e5f4-421c-b823-e1bad1889eff',
 ]
 
 let currentRpcIndex = 0
@@ -90,11 +88,11 @@ async function rpcCall(
     }
 
     if (!response.ok) {
-      // Try another endpoint on server errors
-      if (response.status >= 500) {
+      // Try another endpoint on server errors or forbidden
+      if (response.status >= 500 || response.status === 403) {
         const nextEndpoint = getNextRpcEndpoint(rpcUrl)
         if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
-          console.log(`Server error on ${rpcUrl}, switching to ${nextEndpoint}`)
+          console.log(`Error ${response.status} on ${rpcUrl}, switching to ${nextEndpoint}`)
           await delay(REQUEST_DELAY_MS)
           return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
         }
