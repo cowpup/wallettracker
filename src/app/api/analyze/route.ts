@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
-const MAX_RETRIES = 5
-const BASE_DELAY_MS = 500
-const REQUEST_DELAY_MS = 100 // Delay between consecutive requests
+const MAX_RETRIES = 3
+const BASE_DELAY_MS = 1000
+const REQUEST_DELAY_MS = 250 // Delay between consecutive requests
+
+// Multiple free RPC endpoints to rotate through when rate limited
+const PUBLIC_RPC_ENDPOINTS = [
+  'https://api.mainnet-beta.solana.com',
+  'https://solana-mainnet.g.alchemy.com/v2/demo',
+  'https://rpc.ankr.com/solana',
+  'https://solana.public-rpc.com',
+]
+
+let currentRpcIndex = 0
 
 interface WalletFlow {
   address: string
@@ -21,7 +31,31 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function rpcCall(rpcUrl: string, method: string, params: any[], retryCount = 0): Promise<any> {
+function getNextRpcEndpoint(currentUrl: string): string | null {
+  // If using a custom RPC, don't rotate
+  if (!PUBLIC_RPC_ENDPOINTS.includes(currentUrl)) {
+    return null
+  }
+
+  // Rotate to next endpoint
+  currentRpcIndex = (currentRpcIndex + 1) % PUBLIC_RPC_ENDPOINTS.length
+  const nextEndpoint = PUBLIC_RPC_ENDPOINTS[currentRpcIndex]
+
+  // If we've cycled back to the original, return null
+  if (nextEndpoint === currentUrl) {
+    return null
+  }
+
+  return nextEndpoint
+}
+
+async function rpcCall(
+  rpcUrl: string,
+  method: string,
+  params: any[],
+  retryCount = 0,
+  endpointsTried = 1
+): Promise<any> {
   try {
     const response = await fetch(rpcUrl, {
       method: 'POST',
@@ -34,30 +68,56 @@ async function rpcCall(rpcUrl: string, method: string, params: any[], retryCount
       }),
     })
 
-    // Handle rate limiting with exponential backoff
+    // Handle rate limiting
     if (response.status === 429) {
-      if (retryCount >= MAX_RETRIES) {
-        throw new Error('Rate limit exceeded. Please use a dedicated RPC endpoint (Helius, QuickNode, etc.) or try again later.')
+      // Try rotating to a different RPC endpoint first
+      const nextEndpoint = getNextRpcEndpoint(rpcUrl)
+      if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
+        console.log(`Rate limited on ${rpcUrl}, switching to ${nextEndpoint}`)
+        await delay(BASE_DELAY_MS)
+        return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
       }
 
-      // Exponential backoff: 500ms, 1000ms, 2000ms, 4000ms, 8000ms
+      // If all endpoints tried or using custom RPC, do exponential backoff
+      if (retryCount >= MAX_RETRIES) {
+        throw new Error('Rate limit exceeded on all endpoints. Please try again in a few minutes or use a dedicated RPC endpoint.')
+      }
+
       const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
       console.log(`Rate limited. Retrying in ${backoffDelay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`)
       await delay(backoffDelay)
-      return rpcCall(rpcUrl, method, params, retryCount + 1)
+      return rpcCall(rpcUrl, method, params, retryCount + 1, endpointsTried)
     }
 
     if (!response.ok) {
+      // Try another endpoint on server errors
+      if (response.status >= 500) {
+        const nextEndpoint = getNextRpcEndpoint(rpcUrl)
+        if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
+          console.log(`Server error on ${rpcUrl}, switching to ${nextEndpoint}`)
+          await delay(REQUEST_DELAY_MS)
+          return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
+        }
+      }
       throw new Error(`RPC request failed: ${response.status}`)
     }
 
     return response.json()
   } catch (error) {
-    // Retry on network errors
-    if (retryCount < MAX_RETRIES && error instanceof TypeError) {
-      const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
-      await delay(backoffDelay)
-      return rpcCall(rpcUrl, method, params, retryCount + 1)
+    // Retry on network errors with endpoint rotation
+    if (error instanceof TypeError) {
+      const nextEndpoint = getNextRpcEndpoint(rpcUrl)
+      if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
+        console.log(`Network error on ${rpcUrl}, switching to ${nextEndpoint}`)
+        await delay(REQUEST_DELAY_MS)
+        return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
+      }
+
+      if (retryCount < MAX_RETRIES) {
+        const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
+        await delay(backoffDelay)
+        return rpcCall(rpcUrl, method, params, retryCount + 1, endpointsTried)
+      }
     }
     throw error
   }
