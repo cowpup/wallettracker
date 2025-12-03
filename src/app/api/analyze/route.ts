@@ -3,10 +3,12 @@ import { NextRequest, NextResponse } from 'next/server'
 const LAMPORTS_PER_SOL = 1_000_000_000
 const MAX_RETRIES = 3
 const BASE_DELAY_MS = 1000
-const REQUEST_DELAY_MS = 250 // Delay between consecutive requests
+const REQUEST_DELAY_MS = 150 // Reduced delay for faster processing with Helius
 
-// Public RPC endpoint (user can provide their own for better rate limits)
+// Default RPC endpoint (Helius free tier)
+const DEFAULT_RPC = 'https://mainnet.helius-rpc.com/?api-key=4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
 const PUBLIC_RPC_ENDPOINTS = [
+  DEFAULT_RPC,
   'https://api.mainnet-beta.solana.com',
 ]
 
@@ -21,6 +23,21 @@ interface WalletFlow {
   firstTxTime: number | null
   lastTxTime: number | null
   error?: string
+}
+
+// Fetch current SOL price from CoinGecko
+async function getSolPrice(): Promise<number> {
+  try {
+    const response = await fetch(
+      'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
+      { next: { revalidate: 60 } } // Cache for 60 seconds
+    )
+    if (!response.ok) return 0
+    const data = await response.json()
+    return data.solana?.usd || 0
+  } catch {
+    return 0
+  }
 }
 
 // Helper to add delay between requests
@@ -276,26 +293,31 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    if (wallets.length > 10) {
+    if (wallets.length > 10000) {
       return NextResponse.json(
-        { error: 'Maximum 10 wallets per request to avoid timeout' },
+        { error: 'Maximum 10,000 wallets per request' },
         { status: 400 }
       )
     }
 
-    // Use provided RPC or default to public endpoint
-    const rpc = rpcUrl || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com'
+    // Use provided RPC or default to Helius
+    const rpc = rpcUrl || process.env.SOLANA_RPC_URL || DEFAULT_RPC
+
+    // Fetch SOL price in parallel with first wallet analysis
+    const solPricePromise = getSolPrice()
 
     const results: WalletFlow[] = []
 
     for (let i = 0; i < wallets.length; i++) {
       // Add delay between wallet analyses to avoid rate limiting
       if (i > 0) {
-        await delay(REQUEST_DELAY_MS * 2) // Slightly longer delay between wallets
+        await delay(REQUEST_DELAY_MS)
       }
       const result = await analyzeWallet(rpc, wallets[i], maxTransactions)
       results.push(result)
     }
+
+    const solPrice = await solPricePromise
 
     // Calculate aggregates
     const aggregate = {
@@ -307,7 +329,7 @@ export async function POST(request: NextRequest) {
       errors: results.filter((r) => r.error).length,
     }
 
-    return NextResponse.json({ results, aggregate })
+    return NextResponse.json({ results, aggregate, solPrice })
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Internal server error' },

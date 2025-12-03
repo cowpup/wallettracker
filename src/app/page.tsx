@@ -23,6 +23,7 @@ interface AnalysisResult {
     totalTransactions: number
     errors: number
   }
+  solPrice: number
 }
 
 function formatDate(timestamp: number | null): string {
@@ -40,6 +41,15 @@ function formatSol(amount: number): string {
   return amount.toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 4,
+  })
+}
+
+function formatUsd(amount: number): string {
+  return amount.toLocaleString('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
   })
 }
 
@@ -67,8 +77,8 @@ export default function Home() {
       return
     }
 
-    if (wallets.length > 10) {
-      setError('Maximum 10 wallets per request')
+    if (wallets.length > 10000) {
+      setError('Maximum 10,000 wallets per request')
       return
     }
 
@@ -117,12 +127,28 @@ export default function Home() {
   const exportCsv = () => {
     if (!results) return
 
-    const headers = ['Wallet', 'Inflow (SOL)', 'Outflow (SOL)', 'Net Flow (SOL)', 'Transactions', 'First Tx', 'Last Tx', 'Error']
+    const solPrice = results.solPrice || 0
+    const headers = [
+      'Wallet',
+      'Inflow (SOL)',
+      'Outflow (SOL)',
+      'Net Flow (SOL)',
+      'Inflow (USD)',
+      'Outflow (USD)',
+      'Net Flow (USD)',
+      'Transactions',
+      'First Tx',
+      'Last Tx',
+      'Error',
+    ]
     const rows = results.results.map((wallet) => [
       wallet.address,
       wallet.totalInflowSol.toFixed(4),
       wallet.totalOutflowSol.toFixed(4),
       wallet.netFlowSol.toFixed(4),
+      (wallet.totalInflowSol * solPrice).toFixed(2),
+      (wallet.totalOutflowSol * solPrice).toFixed(2),
+      (wallet.netFlowSol * solPrice).toFixed(2),
       wallet.transactionCount.toString(),
       wallet.firstTxTime ? new Date(wallet.firstTxTime * 1000).toISOString() : '',
       wallet.lastTxTime ? new Date(wallet.lastTxTime * 1000).toISOString() : '',
@@ -130,6 +156,7 @@ export default function Home() {
     ])
 
     const csvContent = [
+      `# SOL Price: $${solPrice.toFixed(2)}`,
       headers.join(','),
       ...rows.map((row) => row.map((cell) => `"${cell}"`).join(',')),
     ].join('\n')
@@ -157,7 +184,7 @@ export default function Home() {
         <div className="bg-zinc-900 rounded-lg p-6 border border-zinc-800">
           <label className="block mb-2 font-medium">
             Wallet Addresses
-            <span className="text-gray-500 font-normal ml-2">(one per line, max 10)</span>
+            <span className="text-gray-500 font-normal ml-2">(one per line, max 10,000)</span>
           </label>
           <textarea
             value={walletInput}
@@ -264,21 +291,36 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
             </div>
           ) : (
             <div className="space-y-4">
+              {results.solPrice > 0 && (
+                <div className="text-xs text-gray-500 text-right">
+                  SOL Price: {formatUsd(results.solPrice)}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-zinc-950 rounded-lg p-4">
                   <div className="text-gray-400 text-sm">Total Inflow</div>
                   <div className="text-2xl font-bold text-green-400">
                     {formatSol(results.aggregate.totalInflowSol)} SOL
                   </div>
+                  {results.solPrice > 0 && (
+                    <div className="text-sm text-green-400/70">
+                      {formatUsd(results.aggregate.totalInflowSol * results.solPrice)}
+                    </div>
+                  )}
                 </div>
                 <div className="bg-zinc-950 rounded-lg p-4">
                   <div className="text-gray-400 text-sm">Total Outflow</div>
                   <div className="text-2xl font-bold text-red-400">
                     {formatSol(results.aggregate.totalOutflowSol)} SOL
                   </div>
+                  {results.solPrice > 0 && (
+                    <div className="text-sm text-red-400/70">
+                      {formatUsd(results.aggregate.totalOutflowSol * results.solPrice)}
+                    </div>
+                  )}
                 </div>
               </div>
-              
+
               <div className="bg-zinc-950 rounded-lg p-4">
                 <div className="text-gray-400 text-sm">Net Flow</div>
                 <div
@@ -289,6 +331,12 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
                   {results.aggregate.netFlowSol >= 0 ? '+' : ''}
                   {formatSol(results.aggregate.netFlowSol)} SOL
                 </div>
+                {results.solPrice > 0 && (
+                  <div className={`text-lg ${results.aggregate.netFlowSol >= 0 ? 'text-green-400/70' : 'text-red-400/70'}`}>
+                    {results.aggregate.netFlowSol >= 0 ? '+' : ''}
+                    {formatUsd(results.aggregate.netFlowSol * results.solPrice)}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-4 text-sm">
