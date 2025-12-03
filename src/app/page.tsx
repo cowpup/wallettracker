@@ -57,6 +57,8 @@ function shortenAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
+const BATCH_SIZE = 25 // Process 25 wallets at a time to avoid timeouts
+
 export default function Home() {
   const [walletInput, setWalletInput] = useState('')
   const [rpcUrl, setRpcUrl] = useState('')
@@ -65,6 +67,37 @@ export default function Home() {
   const [results, setResults] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [progress, setProgress] = useState({ current: 0, total: 0 })
+
+  const analyzeBatch = async (wallets: string[], rpcUrl: string | undefined, maxTx: number): Promise<{ results: WalletFlow[], solPrice: number }> => {
+    const response = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wallets,
+        rpcUrl: rpcUrl || undefined,
+        maxTransactions: maxTx,
+      }),
+    })
+
+    const text = await response.text()
+
+    let data
+    try {
+      data = JSON.parse(text)
+    } catch {
+      if (text.includes('timeout') || text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
+        throw new Error('Request timed out')
+      }
+      throw new Error('Server error')
+    }
+
+    if (!response.ok) {
+      throw new Error(data.error || 'Analysis failed')
+    }
+
+    return { results: data.results, solPrice: data.solPrice }
+  }
 
   const handleAnalyze = async () => {
     const wallets = walletInput
@@ -85,40 +118,63 @@ export default function Home() {
     setLoading(true)
     setError(null)
     setResults(null)
+    setProgress({ current: 0, total: wallets.length })
+
+    const allResults: WalletFlow[] = []
+    let solPrice = 0
+    let batchErrors = 0
 
     try {
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wallets,
-          rpcUrl: rpcUrl || undefined,
-          maxTransactions: maxTx,
-        }),
-      })
+      // Process in batches
+      for (let i = 0; i < wallets.length; i += BATCH_SIZE) {
+        const batch = wallets.slice(i, i + BATCH_SIZE)
 
-      const text = await response.text()
-
-      let data
-      try {
-        data = JSON.parse(text)
-      } catch {
-        // Server returned non-JSON (likely timeout or error page)
-        if (text.includes('timeout') || text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
-          throw new Error('Request timed out. Try analyzing fewer wallets at a time (50-100).')
+        try {
+          const batchResult = await analyzeBatch(batch, rpcUrl || undefined, maxTx)
+          allResults.push(...batchResult.results)
+          if (batchResult.solPrice > 0) {
+            solPrice = batchResult.solPrice
+          }
+        } catch (err) {
+          // If a batch fails, mark all wallets in that batch as errored
+          batchErrors++
+          batch.forEach(address => {
+            allResults.push({
+              address,
+              totalInflowSol: 0,
+              totalOutflowSol: 0,
+              netFlowSol: 0,
+              transactionCount: 0,
+              firstTxTime: null,
+              lastTxTime: null,
+              error: err instanceof Error ? err.message : 'Batch failed',
+            })
+          })
         }
-        throw new Error('Server error. Try again with fewer wallets.')
+
+        setProgress({ current: Math.min(i + BATCH_SIZE, wallets.length), total: wallets.length })
       }
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Analysis failed')
+      // Calculate aggregates from all results
+      const aggregate = {
+        totalWallets: allResults.length,
+        totalInflowSol: allResults.reduce((sum, r) => sum + r.totalInflowSol, 0),
+        totalOutflowSol: allResults.reduce((sum, r) => sum + r.totalOutflowSol, 0),
+        netFlowSol: allResults.reduce((sum, r) => sum + r.netFlowSol, 0),
+        totalTransactions: allResults.reduce((sum, r) => sum + r.transactionCount, 0),
+        errors: allResults.filter((r) => r.error).length,
       }
 
-      setResults(data)
+      setResults({ results: allResults, aggregate, solPrice })
+
+      if (batchErrors > 0) {
+        setError(`Completed with ${batchErrors} failed batch(es). Some wallets may have errors.`)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred')
     } finally {
       setLoading(false)
+      setProgress({ current: 0, total: 0 })
     }
   }
 
@@ -278,12 +334,28 @@ DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK"
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                Analyzing...
+                {progress.total > 0
+                  ? `Analyzing... ${progress.current} / ${progress.total} wallets`
+                  : 'Analyzing...'}
               </>
             ) : (
               'Analyze Wallets'
             )}
           </button>
+
+          {loading && progress.total > 0 && (
+            <div className="mt-3">
+              <div className="w-full bg-zinc-800 rounded-full h-2">
+                <div
+                  className="bg-purple-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-500 mt-1 text-center">
+                Processing in batches of {BATCH_SIZE} to avoid timeouts
+              </p>
+            </div>
+          )}
 
           {error && (
             <div className="mt-4 p-4 bg-red-900/30 border border-red-800 rounded-lg text-red-300">
