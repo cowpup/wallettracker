@@ -97,7 +97,18 @@ export default function Home() {
         }),
       })
 
-      const data = await response.json()
+      const text = await response.text()
+
+      let data
+      try {
+        data = JSON.parse(text)
+      } catch {
+        // Server returned non-JSON (likely timeout or error page)
+        if (text.includes('timeout') || text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
+          throw new Error('Request timed out. Try analyzing fewer wallets at a time (50-100).')
+        }
+        throw new Error('Server error. Try again with fewer wallets.')
+      }
 
       if (!response.ok) {
         throw new Error(data.error || 'Analysis failed')
