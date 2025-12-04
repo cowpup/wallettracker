@@ -75,27 +75,27 @@ async function rpcCall(rpcUrl: string, method: string, params: any[], retryCount
   }
 }
 
-// Batch RPC call - send multiple requests in one HTTP call
-async function batchRpcCall(rpcUrl: string, requests: { method: string; params: any[] }[]): Promise<any[]> {
-  const body = requests.map((req, i) => ({
-    jsonrpc: '2.0',
-    id: i,
-    method: req.method,
-    params: req.params,
-  }))
+// Parallel RPC calls - fetch multiple transactions at once
+async function parallelRpcCalls(
+  rpcUrl: string,
+  signatures: string[],
+  concurrency: number = 10
+): Promise<any[]> {
+  const results: any[] = []
 
-  const response = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Batch RPC failed: ${response.status}`)
+  for (let i = 0; i < signatures.length; i += concurrency) {
+    const batch = signatures.slice(i, i + concurrency)
+    const promises = batch.map(sig =>
+      rpcCall(rpcUrl, 'getTransaction', [
+        sig,
+        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
+      ]).catch(() => ({ result: null }))
+    )
+    const batchResults = await Promise.all(promises)
+    results.push(...batchResults)
   }
 
-  const results = await response.json()
-  return Array.isArray(results) ? results.sort((a, b) => a.id - b.id) : [results]
+  return results
 }
 
 async function analyzeWalletFast(
@@ -132,60 +132,46 @@ async function analyzeWalletFast(
     const lastTxTime = signatures[0]?.blockTime || null
     const validSignatures = signatures.filter((s: any) => !s.err).slice(0, maxTransactions)
 
-    // Step 2: Batch fetch transactions (up to 100 at a time)
+    // Step 2: Fetch transactions in parallel (10 at a time)
     let totalInflow = 0
     let totalOutflow = 0
     let processed = 0
 
-    const batchSize = 100
-    for (let i = 0; i < validSignatures.length; i += batchSize) {
-      const batch = validSignatures.slice(i, i + batchSize)
+    const signatureStrings = validSignatures.map((s: any) => s.signature)
+    const txResults = await parallelRpcCalls(rpcUrl, signatureStrings, 10)
 
-      const requests = batch.map((sig: any) => ({
-        method: 'getTransaction',
-        params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
-      }))
+    for (const txResult of txResults) {
+      const tx = txResult?.result
+      if (!tx) continue
 
-      try {
-        const txResults = await batchRpcCall(rpcUrl, requests)
+      const meta = tx.meta
+      if (!meta) continue
 
-        for (const txResult of txResults) {
-          if (!txResult.result) continue
+      const preBalances = meta.preBalances || []
+      const postBalances = meta.postBalances || []
 
-          const tx = txResult.result
-          const meta = tx.meta
-          if (!meta) continue
-
-          const preBalances = meta.preBalances || []
-          const postBalances = meta.postBalances || []
-
-          let accountKeys = tx.transaction?.message?.accountKeys || []
-          if (accountKeys.length > 0 && typeof accountKeys[0] === 'object') {
-            accountKeys = accountKeys.map((k: any) => k.pubkey || k)
-          }
-
-          const walletIndex = accountKeys.findIndex((k: string) => k === walletAddress)
-
-          if (
-            walletIndex !== -1 &&
-            walletIndex < preBalances.length &&
-            walletIndex < postBalances.length
-          ) {
-            const diff = postBalances[walletIndex] - preBalances[walletIndex]
-
-            if (diff > 0) {
-              totalInflow += diff
-            } else {
-              totalOutflow += Math.abs(diff)
-            }
-          }
-
-          processed++
-        }
-      } catch (batchError) {
-        // If batch fails, continue with what we have
-        console.error('Batch error:', batchError)
+      let accountKeys = tx.transaction?.message?.accountKeys || []
+      if (accountKeys.length > 0 && typeof accountKeys[0] === 'object') {
+        accountKeys = accountKeys.map((k: any) => k.pubkey || k)
       }
+
+      const walletIndex = accountKeys.findIndex((k: string) => k === walletAddress)
+
+      if (
+        walletIndex !== -1 &&
+        walletIndex < preBalances.length &&
+        walletIndex < postBalances.length
+      ) {
+        const diff = postBalances[walletIndex] - preBalances[walletIndex]
+
+        if (diff > 0) {
+          totalInflow += diff
+        } else {
+          totalOutflow += Math.abs(diff)
+        }
+      }
+
+      processed++
     }
 
     return {
