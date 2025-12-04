@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
 const HELIUS_API_KEY = '4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
-const PARALLEL_WALLETS = 5 // Process 5 wallets in parallel (stay under 10 req/s limit)
-const BATCH_DELAY_MS = 600 // Wait 600ms between batches to respect rate limit
+const PARALLEL_WALLETS = 2 // Process 2 wallets in parallel
+const BATCH_DELAY_MS = 250 // Wait 250ms between batches (~4-5 req/s)
 
 interface WalletFlow {
   address: string
@@ -41,10 +41,15 @@ async function getSolPrice(): Promise<number> {
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 // Use Helius enhanced API - gets parsed transactions in ONE call
 async function analyzeWalletHelius(
   walletAddress: string,
-  maxTransactions: number
+  maxTransactions: number,
+  retryCount: number = 0
 ): Promise<WalletFlow> {
   try {
     // Helius enhanced transactions API - returns parsed data directly
@@ -53,7 +58,11 @@ async function analyzeWalletHelius(
     const response = await fetch(url)
 
     if (response.status === 429) {
-      // Return with error but don't throw - let other wallets continue
+      // Retry up to 3 times with increasing delay
+      if (retryCount < 3) {
+        await delay(1000 * (retryCount + 1)) // 1s, 2s, 3s
+        return analyzeWalletHelius(walletAddress, maxTransactions, retryCount + 1)
+      }
       return {
         address: walletAddress,
         totalInflowSol: 0,
@@ -62,7 +71,7 @@ async function analyzeWalletHelius(
         transactionCount: 0,
         firstTxTime: null,
         lastTxTime: null,
-        error: 'Rate limited - try again',
+        error: 'Rate limited',
       }
     }
 
@@ -134,10 +143,6 @@ async function analyzeWalletHelius(
       error: error instanceof Error ? error.message : 'Unknown error',
     }
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 // Process wallets in parallel with rate limiting
