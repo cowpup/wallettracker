@@ -1,13 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
-const MAX_RETRIES = 2
-const BASE_DELAY_MS = 300
-const PARALLEL_WALLETS = 5 // Process 5 wallets in parallel
-const PARALLEL_TXS = 10 // Fetch 10 transactions in parallel per wallet
-
-// Default RPC endpoint (Helius free tier)
-const DEFAULT_RPC = 'https://mainnet.helius-rpc.com/?api-key=4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
+const HELIUS_API_KEY = '4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
+const PARALLEL_WALLETS = 10 // Process 10 wallets in parallel
 
 interface WalletFlow {
   address: string
@@ -18,6 +13,16 @@ interface WalletFlow {
   firstTxTime: number | null
   lastTxTime: number | null
   error?: string
+}
+
+interface HeliusTransaction {
+  signature: string
+  timestamp: number
+  nativeTransfers: {
+    fromUserAccount: string
+    toUserAccount: string
+    amount: number
+  }[]
 }
 
 // Fetch current SOL price from CoinGecko
@@ -35,89 +40,48 @@ async function getSolPrice(): Promise<number> {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-async function rpcCall(rpcUrl: string, method: string, params: any[], retryCount = 0): Promise<any> {
-  try {
-    const response = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method,
-        params,
-      }),
-    })
-
-    if (response.status === 429) {
-      if (retryCount >= MAX_RETRIES) {
-        throw new Error('Rate limited')
-      }
-      const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
-      await delay(backoffDelay)
-      return rpcCall(rpcUrl, method, params, retryCount + 1)
-    }
-
-    if (!response.ok) {
-      throw new Error(`RPC failed: ${response.status}`)
-    }
-
-    return response.json()
-  } catch (error) {
-    if (retryCount < MAX_RETRIES) {
-      const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
-      await delay(backoffDelay)
-      return rpcCall(rpcUrl, method, params, retryCount + 1)
-    }
-    throw error
-  }
-}
-
-// Parallel RPC calls - fetch multiple transactions at once
-async function parallelRpcCalls(
-  rpcUrl: string,
-  signatures: string[],
-  concurrency: number = 10
-): Promise<any[]> {
-  const results: any[] = []
-
-  for (let i = 0; i < signatures.length; i += concurrency) {
-    const batch = signatures.slice(i, i + concurrency)
-    const promises = batch.map(sig =>
-      rpcCall(rpcUrl, 'getTransaction', [
-        sig,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
-      ]).catch(() => ({ result: null }))
-    )
-    const batchResults = await Promise.all(promises)
-    results.push(...batchResults)
-  }
-
-  return results
-}
-
-async function analyzeWalletFast(
-  rpcUrl: string,
+// Use Helius enhanced API - gets parsed transactions in ONE call
+async function analyzeWalletHelius(
   walletAddress: string,
   maxTransactions: number
 ): Promise<WalletFlow> {
   try {
-    // Step 1: Get signatures (just metadata, very fast)
-    const sigResult = await rpcCall(rpcUrl, 'getSignaturesForAddress', [
-      walletAddress,
-      { limit: Math.min(maxTransactions, 1000) },
-    ])
+    // Helius enhanced transactions API - returns parsed data directly
+    const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=${Math.min(maxTransactions, 100)}`
 
-    if (sigResult.error) {
-      throw new Error(sigResult.error.message || 'Failed to get signatures')
+    const response = await fetch(url)
+
+    if (response.status === 429) {
+      // Return with error but don't throw - let other wallets continue
+      return {
+        address: walletAddress,
+        totalInflowSol: 0,
+        totalOutflowSol: 0,
+        netFlowSol: 0,
+        transactionCount: 0,
+        firstTxTime: null,
+        lastTxTime: null,
+        error: 'Rate limited - try again',
+      }
     }
 
-    const signatures = sigResult.result || []
+    if (!response.ok) {
+      return {
+        address: walletAddress,
+        totalInflowSol: 0,
+        totalOutflowSol: 0,
+        netFlowSol: 0,
+        transactionCount: 0,
+        firstTxTime: null,
+        lastTxTime: null,
+        error: `API error: ${response.status}`,
+      }
+    }
 
-    if (signatures.length === 0) {
+    const transactions: HeliusTransaction[] = await response.json()
+
+    if (!transactions || transactions.length === 0) {
+      // No transactions is NOT an error - just an empty wallet
       return {
         address: walletAddress,
         totalInflowSol: 0,
@@ -129,58 +93,31 @@ async function analyzeWalletFast(
       }
     }
 
-    const firstTxTime = signatures[signatures.length - 1]?.blockTime || null
-    const lastTxTime = signatures[0]?.blockTime || null
-    const validSignatures = signatures.filter((s: any) => !s.err).slice(0, maxTransactions)
-
-    // Step 2: Fetch transactions in parallel (10 at a time)
     let totalInflow = 0
     let totalOutflow = 0
-    let processed = 0
 
-    const signatureStrings = validSignatures.map((s: any) => s.signature)
-    const txResults = await parallelRpcCalls(rpcUrl, signatureStrings, PARALLEL_TXS)
+    for (const tx of transactions) {
+      if (!tx.nativeTransfers) continue
 
-    for (const txResult of txResults) {
-      const tx = txResult?.result
-      if (!tx) continue
-
-      const meta = tx.meta
-      if (!meta) continue
-
-      const preBalances = meta.preBalances || []
-      const postBalances = meta.postBalances || []
-
-      let accountKeys = tx.transaction?.message?.accountKeys || []
-      if (accountKeys.length > 0 && typeof accountKeys[0] === 'object') {
-        accountKeys = accountKeys.map((k: any) => k.pubkey || k)
-      }
-
-      const walletIndex = accountKeys.findIndex((k: string) => k === walletAddress)
-
-      if (
-        walletIndex !== -1 &&
-        walletIndex < preBalances.length &&
-        walletIndex < postBalances.length
-      ) {
-        const diff = postBalances[walletIndex] - preBalances[walletIndex]
-
-        if (diff > 0) {
-          totalInflow += diff
-        } else {
-          totalOutflow += Math.abs(diff)
+      for (const transfer of tx.nativeTransfers) {
+        if (transfer.toUserAccount === walletAddress) {
+          totalInflow += transfer.amount
+        }
+        if (transfer.fromUserAccount === walletAddress) {
+          totalOutflow += transfer.amount
         }
       }
-
-      processed++
     }
+
+    const firstTxTime = transactions[transactions.length - 1]?.timestamp || null
+    const lastTxTime = transactions[0]?.timestamp || null
 
     return {
       address: walletAddress,
       totalInflowSol: totalInflow / LAMPORTS_PER_SOL,
       totalOutflowSol: totalOutflow / LAMPORTS_PER_SOL,
       netFlowSol: (totalInflow - totalOutflow) / LAMPORTS_PER_SOL,
-      transactionCount: processed,
+      transactionCount: transactions.length,
       firstTxTime,
       lastTxTime,
     }
@@ -198,19 +135,17 @@ async function analyzeWalletFast(
   }
 }
 
-// Process wallets in parallel chunks
+// Process wallets in parallel
 async function processWalletsParallel(
-  rpcUrl: string,
   wallets: string[],
-  maxTransactions: number,
-  parallelCount: number
+  maxTransactions: number
 ): Promise<WalletFlow[]> {
   const results: WalletFlow[] = []
 
-  for (let i = 0; i < wallets.length; i += parallelCount) {
-    const chunk = wallets.slice(i, i + parallelCount)
+  for (let i = 0; i < wallets.length; i += PARALLEL_WALLETS) {
+    const chunk = wallets.slice(i, i + PARALLEL_WALLETS)
     const chunkResults = await Promise.all(
-      chunk.map(wallet => analyzeWalletFast(rpcUrl, wallet, maxTransactions))
+      chunk.map(wallet => analyzeWalletHelius(wallet, maxTransactions))
     )
     results.push(...chunkResults)
   }
@@ -221,7 +156,7 @@ async function processWalletsParallel(
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { wallets, rpcUrl, maxTransactions = 100 } = body
+    const { wallets, maxTransactions = 100 } = body
 
     if (!wallets || !Array.isArray(wallets) || wallets.length === 0) {
       return NextResponse.json(
@@ -237,11 +172,9 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const rpc = rpcUrl || process.env.SOLANA_RPC_URL || DEFAULT_RPC
-
     // Fetch SOL price in parallel
     const [results, solPrice] = await Promise.all([
-      processWalletsParallel(rpc, wallets, maxTransactions, PARALLEL_WALLETS),
+      processWalletsParallel(wallets, maxTransactions),
       getSolPrice(),
     ])
 
