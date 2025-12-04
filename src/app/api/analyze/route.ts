@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
 const HELIUS_API_KEY = '4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
-const PARALLEL_WALLETS = 10 // Process 10 wallets in parallel
+const PARALLEL_WALLETS = 5 // Process 5 wallets in parallel (stay under 10 req/s limit)
+const BATCH_DELAY_MS = 600 // Wait 600ms between batches to respect rate limit
 
 interface WalletFlow {
   address: string
@@ -135,7 +136,11 @@ async function analyzeWalletHelius(
   }
 }
 
-// Process wallets in parallel
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Process wallets in parallel with rate limiting
 async function processWalletsParallel(
   wallets: string[],
   maxTransactions: number
@@ -148,6 +153,11 @@ async function processWalletsParallel(
       chunk.map(wallet => analyzeWalletHelius(wallet, maxTransactions))
     )
     results.push(...chunkResults)
+
+    // Wait between batches to respect rate limit (except for last batch)
+    if (i + PARALLEL_WALLETS < wallets.length) {
+      await delay(BATCH_DELAY_MS)
+    }
   }
 
   return results
