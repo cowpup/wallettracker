@@ -57,7 +57,7 @@ function shortenAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
-const BATCH_SIZE = 25 // Process 25 wallets at a time to avoid timeouts
+const BATCH_SIZE = 50 // Process 50 wallets at a time
 
 export default function Home() {
   const [walletInput, setWalletInput] = useState('')

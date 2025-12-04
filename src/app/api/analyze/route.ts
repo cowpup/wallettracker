@@ -2,17 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
 const MAX_RETRIES = 3
-const BASE_DELAY_MS = 1000
-const REQUEST_DELAY_MS = 150 // Reduced delay for faster processing with Helius
+const BASE_DELAY_MS = 500
+const PARALLEL_REQUESTS = 10 // Process 10 wallets in parallel
 
 // Default RPC endpoint (Helius free tier)
 const DEFAULT_RPC = 'https://mainnet.helius-rpc.com/?api-key=4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
-const PUBLIC_RPC_ENDPOINTS = [
-  DEFAULT_RPC,
-  'https://api.mainnet-beta.solana.com',
-]
-
-let currentRpcIndex = 0
 
 interface WalletFlow {
   address: string
@@ -30,7 +24,7 @@ async function getSolPrice(): Promise<number> {
   try {
     const response = await fetch(
       'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
-      { next: { revalidate: 60 } } // Cache for 60 seconds
+      { next: { revalidate: 60 } }
     )
     if (!response.ok) return 0
     const data = await response.json()
@@ -40,36 +34,11 @@ async function getSolPrice(): Promise<number> {
   }
 }
 
-// Helper to add delay between requests
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-function getNextRpcEndpoint(currentUrl: string): string | null {
-  // If using a custom RPC, don't rotate
-  if (!PUBLIC_RPC_ENDPOINTS.includes(currentUrl)) {
-    return null
-  }
-
-  // Rotate to next endpoint
-  currentRpcIndex = (currentRpcIndex + 1) % PUBLIC_RPC_ENDPOINTS.length
-  const nextEndpoint = PUBLIC_RPC_ENDPOINTS[currentRpcIndex]
-
-  // If we've cycled back to the original, return null
-  if (nextEndpoint === currentUrl) {
-    return null
-  }
-
-  return nextEndpoint
-}
-
-async function rpcCall(
-  rpcUrl: string,
-  method: string,
-  params: any[],
-  retryCount = 0,
-  endpointsTried = 1
-): Promise<any> {
+async function rpcCall(rpcUrl: string, method: string, params: any[], retryCount = 0): Promise<any> {
   try {
     const response = await fetch(rpcUrl, {
       method: 'POST',
@@ -82,114 +51,70 @@ async function rpcCall(
       }),
     })
 
-    // Handle rate limiting
     if (response.status === 429) {
-      // Try rotating to a different RPC endpoint first
-      const nextEndpoint = getNextRpcEndpoint(rpcUrl)
-      if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
-        console.log(`Rate limited on ${rpcUrl}, switching to ${nextEndpoint}`)
-        await delay(BASE_DELAY_MS)
-        return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
-      }
-
-      // If all endpoints tried or using custom RPC, do exponential backoff
       if (retryCount >= MAX_RETRIES) {
-        throw new Error('Rate limit exceeded on all endpoints. Please try again in a few minutes or use a dedicated RPC endpoint.')
+        throw new Error('Rate limited')
       }
-
       const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
-      console.log(`Rate limited. Retrying in ${backoffDelay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`)
       await delay(backoffDelay)
-      return rpcCall(rpcUrl, method, params, retryCount + 1, endpointsTried)
+      return rpcCall(rpcUrl, method, params, retryCount + 1)
     }
 
     if (!response.ok) {
-      // Try another endpoint on server errors, forbidden, or unauthorized
-      if (response.status >= 500 || response.status === 403 || response.status === 401) {
-        const nextEndpoint = getNextRpcEndpoint(rpcUrl)
-        if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
-          console.log(`Error ${response.status} on ${rpcUrl}, switching to ${nextEndpoint}`)
-          await delay(REQUEST_DELAY_MS)
-          return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
-        }
-      }
-      throw new Error(`RPC request failed: ${response.status}`)
+      throw new Error(`RPC failed: ${response.status}`)
     }
 
     return response.json()
   } catch (error) {
-    // Retry on network errors with endpoint rotation
-    if (error instanceof TypeError) {
-      const nextEndpoint = getNextRpcEndpoint(rpcUrl)
-      if (nextEndpoint && endpointsTried < PUBLIC_RPC_ENDPOINTS.length) {
-        console.log(`Network error on ${rpcUrl}, switching to ${nextEndpoint}`)
-        await delay(REQUEST_DELAY_MS)
-        return rpcCall(nextEndpoint, method, params, 0, endpointsTried + 1)
-      }
-
-      if (retryCount < MAX_RETRIES) {
-        const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
-        await delay(backoffDelay)
-        return rpcCall(rpcUrl, method, params, retryCount + 1, endpointsTried)
-      }
+    if (retryCount < MAX_RETRIES) {
+      const backoffDelay = BASE_DELAY_MS * Math.pow(2, retryCount)
+      await delay(backoffDelay)
+      return rpcCall(rpcUrl, method, params, retryCount + 1)
     }
     throw error
   }
 }
 
-async function getSignatures(rpcUrl: string, walletAddress: string, limit: number = 1000) {
-  const allSignatures: any[] = []
-  let before: string | undefined
-  let isFirstRequest = true
+// Batch RPC call - send multiple requests in one HTTP call
+async function batchRpcCall(rpcUrl: string, requests: { method: string; params: any[] }[]): Promise<any[]> {
+  const body = requests.map((req, i) => ({
+    jsonrpc: '2.0',
+    id: i,
+    method: req.method,
+    params: req.params,
+  }))
 
-  while (allSignatures.length < limit) {
-    // Add delay between pagination requests (not on first request)
-    if (!isFirstRequest) {
-      await delay(REQUEST_DELAY_MS)
-    }
-    isFirstRequest = false
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 
-    const params: any[] = [
-      walletAddress,
-      { limit: Math.min(1000, limit - allSignatures.length) },
-    ]
-    if (before) {
-      params[1].before = before
-    }
-
-    const result = await rpcCall(rpcUrl, 'getSignaturesForAddress', params)
-
-    if (result.error) {
-      throw new Error(`RPC Error: ${JSON.stringify(result.error)}`)
-    }
-
-    const signatures = result.result || []
-    if (signatures.length === 0) break
-
-    allSignatures.push(...signatures)
-    before = signatures[signatures.length - 1].signature
+  if (!response.ok) {
+    throw new Error(`Batch RPC failed: ${response.status}`)
   }
 
-  return allSignatures
+  const results = await response.json()
+  return Array.isArray(results) ? results.sort((a, b) => a.id - b.id) : [results]
 }
 
-async function getTransaction(rpcUrl: string, signature: string) {
-  const result = await rpcCall(rpcUrl, 'getTransaction', [
-    signature,
-    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
-  ])
-
-  if (result.error) return null
-  return result.result
-}
-
-async function analyzeWallet(
+async function analyzeWalletFast(
   rpcUrl: string,
   walletAddress: string,
-  maxTransactions: number = 200
+  maxTransactions: number
 ): Promise<WalletFlow> {
   try {
-    const signatures = await getSignatures(rpcUrl, walletAddress, maxTransactions)
+    // Step 1: Get signatures (just metadata, very fast)
+    const sigResult = await rpcCall(rpcUrl, 'getSignaturesForAddress', [
+      walletAddress,
+      { limit: Math.min(maxTransactions, 1000) },
+    ])
+
+    if (sigResult.error) {
+      throw new Error(sigResult.error.message || 'Failed to get signatures')
+    }
+
+    const signatures = sigResult.result || []
 
     if (signatures.length === 0) {
       return {
@@ -203,66 +128,71 @@ async function analyzeWallet(
       }
     }
 
+    const firstTxTime = signatures[signatures.length - 1]?.blockTime || null
+    const lastTxTime = signatures[0]?.blockTime || null
+    const validSignatures = signatures.filter((s: any) => !s.err).slice(0, maxTransactions)
+
+    // Step 2: Batch fetch transactions (up to 100 at a time)
     let totalInflow = 0
     let totalOutflow = 0
     let processed = 0
 
-    const firstTxTime = signatures[signatures.length - 1]?.blockTime || null
-    const lastTxTime = signatures[0]?.blockTime || null
+    const batchSize = 100
+    for (let i = 0; i < validSignatures.length; i += batchSize) {
+      const batch = validSignatures.slice(i, i + batchSize)
 
-    // Process transactions (limit to avoid timeout)
-    const txsToProcess = signatures.slice(0, Math.min(maxTransactions, 100))
+      const requests = batch.map((sig: any) => ({
+        method: 'getTransaction',
+        params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
+      }))
 
-    for (let i = 0; i < txsToProcess.length; i++) {
-      const sigInfo = txsToProcess[i]
-      if (sigInfo.err) continue
+      try {
+        const txResults = await batchRpcCall(rpcUrl, requests)
 
-      // Add delay between transaction fetches to avoid rate limiting
-      if (i > 0) {
-        await delay(REQUEST_DELAY_MS)
-      }
+        for (const txResult of txResults) {
+          if (!txResult.result) continue
 
-      const tx = await getTransaction(rpcUrl, sigInfo.signature)
-      if (!tx) continue
+          const tx = txResult.result
+          const meta = tx.meta
+          if (!meta) continue
 
-      const meta = tx.meta
-      if (!meta) continue
+          const preBalances = meta.preBalances || []
+          const postBalances = meta.postBalances || []
 
-      const preBalances = meta.preBalances || []
-      const postBalances = meta.postBalances || []
-      
-      let accountKeys = tx.transaction?.message?.accountKeys || []
-      if (accountKeys.length > 0 && typeof accountKeys[0] === 'object') {
-        accountKeys = accountKeys.map((k: any) => k.pubkey || k)
-      }
+          let accountKeys = tx.transaction?.message?.accountKeys || []
+          if (accountKeys.length > 0 && typeof accountKeys[0] === 'object') {
+            accountKeys = accountKeys.map((k: any) => k.pubkey || k)
+          }
 
-      const walletIndex = accountKeys.findIndex((k: string) => k === walletAddress)
+          const walletIndex = accountKeys.findIndex((k: string) => k === walletAddress)
 
-      if (
-        walletIndex !== -1 &&
-        walletIndex < preBalances.length &&
-        walletIndex < postBalances.length
-      ) {
-        const diff = postBalances[walletIndex] - preBalances[walletIndex]
+          if (
+            walletIndex !== -1 &&
+            walletIndex < preBalances.length &&
+            walletIndex < postBalances.length
+          ) {
+            const diff = postBalances[walletIndex] - preBalances[walletIndex]
 
-        if (diff > 0) {
-          totalInflow += diff
-        } else {
-          totalOutflow += Math.abs(diff)
+            if (diff > 0) {
+              totalInflow += diff
+            } else {
+              totalOutflow += Math.abs(diff)
+            }
+          }
+
+          processed++
         }
+      } catch (batchError) {
+        // If batch fails, continue with what we have
+        console.error('Batch error:', batchError)
       }
-
-      processed++
     }
-
-    const inflowSol = totalInflow / LAMPORTS_PER_SOL
-    const outflowSol = totalOutflow / LAMPORTS_PER_SOL
 
     return {
       address: walletAddress,
-      totalInflowSol: inflowSol,
-      totalOutflowSol: outflowSol,
-      netFlowSol: inflowSol - outflowSol,
+      totalInflowSol: totalInflow / LAMPORTS_PER_SOL,
+      totalOutflowSol: totalOutflow / LAMPORTS_PER_SOL,
+      netFlowSol: (totalInflow - totalOutflow) / LAMPORTS_PER_SOL,
       transactionCount: processed,
       firstTxTime,
       lastTxTime,
@@ -279,6 +209,26 @@ async function analyzeWallet(
       error: error instanceof Error ? error.message : 'Unknown error',
     }
   }
+}
+
+// Process wallets in parallel chunks
+async function processWalletsParallel(
+  rpcUrl: string,
+  wallets: string[],
+  maxTransactions: number,
+  parallelCount: number
+): Promise<WalletFlow[]> {
+  const results: WalletFlow[] = []
+
+  for (let i = 0; i < wallets.length; i += parallelCount) {
+    const chunk = wallets.slice(i, i + parallelCount)
+    const chunkResults = await Promise.all(
+      chunk.map(wallet => analyzeWalletFast(rpcUrl, wallet, maxTransactions))
+    )
+    results.push(...chunkResults)
+  }
+
+  return results
 }
 
 export async function POST(request: NextRequest) {
@@ -300,26 +250,14 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Use provided RPC or default to Helius
     const rpc = rpcUrl || process.env.SOLANA_RPC_URL || DEFAULT_RPC
 
-    // Fetch SOL price in parallel with first wallet analysis
-    const solPricePromise = getSolPrice()
+    // Fetch SOL price in parallel
+    const [results, solPrice] = await Promise.all([
+      processWalletsParallel(rpc, wallets, maxTransactions, PARALLEL_REQUESTS),
+      getSolPrice(),
+    ])
 
-    const results: WalletFlow[] = []
-
-    for (let i = 0; i < wallets.length; i++) {
-      // Add delay between wallet analyses to avoid rate limiting
-      if (i > 0) {
-        await delay(REQUEST_DELAY_MS)
-      }
-      const result = await analyzeWallet(rpc, wallets[i], maxTransactions)
-      results.push(result)
-    }
-
-    const solPrice = await solPricePromise
-
-    // Calculate aggregates
     const aggregate = {
       totalWallets: results.length,
       totalInflowSol: results.reduce((sum, r) => sum + r.totalInflowSol, 0),
