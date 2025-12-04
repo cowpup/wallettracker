@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const LAMPORTS_PER_SOL = 1_000_000_000
-const MAX_RETRIES = 3
-const BASE_DELAY_MS = 500
-const PARALLEL_REQUESTS = 10 // Process 10 wallets in parallel
+const MAX_RETRIES = 2
+const BASE_DELAY_MS = 300
+const PARALLEL_WALLETS = 5 // Process 5 wallets in parallel
+const PARALLEL_TXS = 10 // Fetch 10 transactions in parallel per wallet
 
 // Default RPC endpoint (Helius free tier)
 const DEFAULT_RPC = 'https://mainnet.helius-rpc.com/?api-key=4d406aa7-10ef-48f8-8bc7-1e1a7a9c70eb'
@@ -138,7 +139,7 @@ async function analyzeWalletFast(
     let processed = 0
 
     const signatureStrings = validSignatures.map((s: any) => s.signature)
-    const txResults = await parallelRpcCalls(rpcUrl, signatureStrings, 10)
+    const txResults = await parallelRpcCalls(rpcUrl, signatureStrings, PARALLEL_TXS)
 
     for (const txResult of txResults) {
       const tx = txResult?.result
@@ -240,7 +241,7 @@ export async function POST(request: NextRequest) {
 
     // Fetch SOL price in parallel
     const [results, solPrice] = await Promise.all([
-      processWalletsParallel(rpc, wallets, maxTransactions, PARALLEL_REQUESTS),
+      processWalletsParallel(rpc, wallets, maxTransactions, PARALLEL_WALLETS),
       getSolPrice(),
     ])
 

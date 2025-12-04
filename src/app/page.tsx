@@ -57,7 +57,7 @@ function shortenAddress(address: string): string {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
-const BATCH_SIZE = 50 // Process 50 wallets at a time
+const BATCH_SIZE = 10 // Process 10 wallets at a time to avoid timeouts
 
 export default function Home() {
   const [walletInput, setWalletInput] = useState('')
@@ -69,34 +69,57 @@ export default function Home() {
   const [showSettings, setShowSettings] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
 
+  // Helper to calculate aggregates
+  const calculateAggregate = (walletResults: WalletFlow[]) => ({
+    totalWallets: walletResults.length,
+    totalInflowSol: walletResults.reduce((sum, r) => sum + r.totalInflowSol, 0),
+    totalOutflowSol: walletResults.reduce((sum, r) => sum + r.totalOutflowSol, 0),
+    netFlowSol: walletResults.reduce((sum, r) => sum + r.netFlowSol, 0),
+    totalTransactions: walletResults.reduce((sum, r) => sum + r.transactionCount, 0),
+    errors: walletResults.filter((r) => r.error).length,
+  })
+
   const analyzeBatch = async (wallets: string[], rpcUrl: string | undefined, maxTx: number): Promise<{ results: WalletFlow[], solPrice: number }> => {
-    const response = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        wallets,
-        rpcUrl: rpcUrl || undefined,
-        maxTransactions: maxTx,
-      }),
-    })
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 55000) // 55s timeout
 
-    const text = await response.text()
-
-    let data
     try {
-      data = JSON.parse(text)
-    } catch {
-      if (text.includes('timeout') || text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallets,
+          rpcUrl: rpcUrl || undefined,
+          maxTransactions: maxTx,
+        }),
+        signal: controller.signal,
+      })
+
+      clearTimeout(timeoutId)
+      const text = await response.text()
+
+      let data
+      try {
+        data = JSON.parse(text)
+      } catch {
+        if (text.includes('timeout') || text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
+          throw new Error('Request timed out')
+        }
+        throw new Error('Server error')
+      }
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Analysis failed')
+      }
+
+      return { results: data.results, solPrice: data.solPrice }
+    } catch (err) {
+      clearTimeout(timeoutId)
+      if (err instanceof Error && err.name === 'AbortError') {
         throw new Error('Request timed out')
       }
-      throw new Error('Server error')
+      throw err
     }
-
-    if (!response.ok) {
-      throw new Error(data.error || 'Analysis failed')
-    }
-
-    return { results: data.results, solPrice: data.solPrice }
   }
 
   const handleAnalyze = async () => {
@@ -152,20 +175,17 @@ export default function Home() {
           })
         }
 
-        setProgress({ current: Math.min(i + BATCH_SIZE, wallets.length), total: wallets.length })
-      }
+        // Update progress and results in real-time
+        const currentProgress = Math.min(i + BATCH_SIZE, wallets.length)
+        setProgress({ current: currentProgress, total: wallets.length })
 
-      // Calculate aggregates from all results
-      const aggregate = {
-        totalWallets: allResults.length,
-        totalInflowSol: allResults.reduce((sum, r) => sum + r.totalInflowSol, 0),
-        totalOutflowSol: allResults.reduce((sum, r) => sum + r.totalOutflowSol, 0),
-        netFlowSol: allResults.reduce((sum, r) => sum + r.netFlowSol, 0),
-        totalTransactions: allResults.reduce((sum, r) => sum + r.transactionCount, 0),
-        errors: allResults.filter((r) => r.error).length,
+        // Update results after each batch so user can see and download
+        setResults({
+          results: [...allResults],
+          aggregate: calculateAggregate(allResults),
+          solPrice,
+        })
       }
-
-      setResults({ results: allResults, aggregate, solPrice })
 
       if (batchErrors > 0) {
         setError(`Completed with ${batchErrors} failed batch(es). Some wallets may have errors.`)
@@ -174,7 +194,6 @@ export default function Home() {
       setError(err instanceof Error ? err.message : 'An error occurred')
     } finally {
       setLoading(false)
-      setProgress({ current: 0, total: 0 })
     }
   }
 
